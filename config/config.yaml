@@ -1,0 +1,208 @@
+# =============================================================================
+# Personalized Query Rewriter Configuration
+# Architecture: FT-Transformer → E2P Projection → Gemma3-1B LoRA
+# Training: CPT → SFT → GRPO
+# =============================================================================
+
+# --- Data ---
+data:
+  input_csv: "data/raw/query_user_profile.csv"  # Output of the SQL join
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  random_seed: 42
+  max_query_length: 64
+  min_query_length: 3
+
+  # User product features (binary indicators from upd_cbds_hhld_prfl_fct)
+  # These are the product columns available after SQL join
+  user_product_features:
+    - "Sapphire Reserve"
+    - "Sapphire Preferred"
+    - "Chase Freedom"
+    - "Chase Freedom Unlimited"
+    - "Amazon Prime Card"
+    - "Amazon Card"
+    - "Southwest Card"
+    - "Southwest Business Card"
+    - "United Card"
+    - "United Business Card"
+    - "Marriott Card"
+    - "IHG Card"
+    - "Hyatt Card"
+    - "AARP Card"
+    - "Disney Card"
+    - "British Airways Card"
+    - "Starbucks Card"
+    - "World of Hyatt Card"
+    - "Ink Business Card"
+    - "Ink Business Points Card"
+    - "Business Credit Card"
+    - "Commercial Credit Card"
+    - "Personal Credit Card"
+    - "Personal Checking"
+    - "Personal Savings"
+    - "Chase Total Checking"
+    - "Chase Secure Checking"
+    - "Student Checking"
+    - "High School Checking"
+    - "Chase Private Client"
+    - "Certificate of Deposit"
+    - "Business Checking"
+    - "Business Savings"
+    - "Business Credit Line"
+    - "Business Trust"
+    - "Mortgage"
+    - "Home Equity"
+    - "Auto Loan"
+    - "Auto Lease"
+    - "Student Loan"
+    - "Personal Line of Credit"
+    - "Investment Account"
+    - "Personal Trust Account"
+    - "Debit Card"
+    - "Ultimate Rewards"
+    - "Mobile Banking"
+    - "Online Banking"
+    - "ATM User"
+
+# --- FT-Transformer (User Encoder) ---
+ft_transformer:
+  num_features: 47           # Number of binary product indicators
+  d_model: 128               # Internal dimension
+  n_heads: 4
+  n_layers: 3
+  d_ffn_factor: 2.0          # FFN hidden = d_model * factor
+  dropout: 0.1
+  attention_dropout: 0.1
+  ffn_dropout: 0.1
+  output_dim: 128            # Final user embedding dimension
+
+# --- E2P Projection ---
+e2p:
+  user_embed_dim: 128        # Must match ft_transformer.output_dim
+  llm_hidden_dim: 1152       # Gemma3-1B hidden size
+  n_prefix_tokens: 1         # Number of soft prefix tokens
+  projection_layers: 2       # MLP depth
+  projection_dropout: 0.1
+
+# --- Personalization Gate (WeWrite-style "When to Write") ---
+gate:
+  input_dim: 128             # ft_transformer.output_dim + query features
+  hidden_dim: 64
+  threshold: 0.5             # Queries above threshold get personalized rewriting
+  dropout: 0.1
+
+# --- LLM Rewriter (Gemma3-1B) ---
+llm:
+  model_name: "google/gemma-3-1b-pt"
+  # For local: "/Volumes/112557_uep102098_ctg_prd_exp/uep/base_models/google/gemma-3-1b-pt"
+  max_new_tokens: 64
+  torch_dtype: "bfloat16"
+
+  # LoRA configuration
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.1
+    target_modules:
+      - "q_proj"
+      - "v_proj"
+      - "k_proj"
+      - "o_proj"
+    bias: "none"
+
+# --- Stage 1: Continual Pre-Training (CPT) ---
+training_cpt:
+  epochs: 2
+  batch_size: 32
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_length: 128
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 100
+  save_strategy: "epoch"
+  output_dir: "outputs/cpt"
+
+# --- Stage 2: Supervised Fine-Tuning (SFT) ---
+training_sft:
+  epochs: 3
+  batch_size: 16
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_length: 128
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 50
+  eval_steps: 500
+  save_strategy: "steps"
+  save_steps: 500
+  output_dir: "outputs/sft"
+
+# --- Stage 3: GRPO Alignment ---
+training_grpo:
+  epochs: 1
+  batch_size: 8
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_length: 128
+  bf16: true
+  gradient_checkpointing: true
+  num_generations: 4          # Group size for GRPO
+  kl_coeff: 0.1              # KL divergence weight
+  temperature: 0.7
+  reward_weights:
+    index_hit: 0.6            # Weight for index hit rate reward
+    semantic_fidelity: 0.3    # Weight for semantic similarity reward
+    length_penalty: 0.1       # Weight for length control
+  output_dir: "outputs/grpo"
+
+# --- User Encoder Training (Contrastive) ---
+training_user_encoder:
+  epochs: 10
+  batch_size: 256
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  temperature: 0.07           # InfoNCE temperature
+  hard_negative_ratio: 0.5    # Fraction of hard negatives per batch
+  output_dir: "outputs/user_encoder"
+
+# --- Evaluation ---
+evaluation:
+  metrics:
+    - "ndcg@5"
+    - "ndcg@10"
+    - "mrr@10"
+    - "recall@5"
+    - "recall@10"
+    - "bleu"
+    - "rouge_l"
+    - "reformulation_rate"
+    - "click_through_rate"
+  position_bias_correction: true
+  stratified_groups:
+    - "product_count"          # Segment by number of products
+    - "has_credit_card"
+    - "has_mortgage"
+    - "is_business_user"
+
+# --- Inference ---
+inference:
+  max_new_tokens: 50
+  num_beams: 5
+  temperature: 0.7
+  semantic_cache:
+    enabled: true
+    similarity_threshold: 0.92
+    max_cache_size: 100000
+    ttl_seconds: 3600
+  user_embedding_cache:
+    enabled: true
+    ttl_seconds: 86400         # 24 hours
