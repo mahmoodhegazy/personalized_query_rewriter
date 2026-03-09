@@ -247,7 +247,7 @@ class FTTransformer(nn.Module):
         attention_weights = []
         for block in self.blocks:
             normed = block.norm1(tokens)
-            _, weights = block.attn(normed, normed, normed, need_weights=True)
+            _, weights = block.attn(normed, normed, normed, need_weights=True, average_attn_weights=False)
             attention_weights.append(weights)
             tokens = block(tokens)
 
